@@ -3,12 +3,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-
 import rosbag2_py
 from visualization_msgs.msg import Marker
 from tf2_msgs.msg import TFMessage
 from geometry_msgs.msg import TransformStamped
-
 import os
 import argparse
 import csv
@@ -16,6 +14,11 @@ import numpy as np
 import tf_transformations
 import bisect
 import sys
+
+# --- NEW: Define the global transform to match the point cloud transformation ---
+R_GLOBAL = np.array([[1, 0, 0],
+                      [0, -1, 0],
+                      [0, 0, -1]])
 
 # --- VIRTUAL KITTI CALIBRATION ---
 # R_CAM_LIDAR: Transform from ROS Lidar (x-fwd, y-left, z-up)
@@ -26,13 +29,11 @@ R_CAM_LIDAR = np.array([
     [ 1,  0,  0]  # z_cam =  x_lidar
 ])
 T_CAM_LIDAR = np.array([0, 0, 0]) # Zero translation
-
 # Convert R_CAM_LIDAR to a 4x4 matrix and then a quaternion
 # This is the rotation from lidar_link -> camera_0
 R_CAM_LIDAR_MAT4 = np.eye(4)
 R_CAM_LIDAR_MAT4[:3, :3] = R_CAM_LIDAR
 Q_CAM_LIDAR = tf_transformations.quaternion_from_matrix(R_CAM_LIDAR_MAT4)
-
 
 class BagToLabels(Node):
     def __init__(self, bag_path, output_path, bbox_topic, tf_topic):
@@ -41,13 +42,11 @@ class BagToLabels(Node):
         self.output_path = output_path
         self.bbox_topic = bbox_topic
         self.tf_topic = tf_topic
-
         self.timestamp_file = os.path.join(self.output_path, 'timestamps.csv')
         self.labels_dir = os.path.join(self.output_path, 'label_2')
         self.calib_dir = os.path.join(self.output_path, 'calib')
         os.makedirs(self.labels_dir, exist_ok=True)
         os.makedirs(self.calib_dir, exist_ok=True)
-
         self.static_transform = None # drone_world -> lidar_link
         self.bbox_messages = [] 
     
@@ -57,21 +56,20 @@ class BagToLabels(Node):
         converter_options = rosbag2_py.ConverterOptions(input_serialization_format='cdr', output_serialization_format='cdr')
         reader.open(storage_options, converter_options)
         return reader
-
+    
     def get_topic_map(self):
         reader = self.get_bag_reader()
         topic_types = reader.get_all_topics_and_types()
         type_map = {topic.name: topic.type for topic in topic_types}
         del reader
         return type_map
-
+    
     def find_static_transform(self, type_map):
         self.get_logger().info(f"Searching for static transform on topic: {self.tf_topic}")
         reader = self.get_bag_reader()
         storage_filter = rosbag2_py.StorageFilter(topics=[self.tf_topic])
         reader.set_filter(storage_filter)
         msg_type = get_message(type_map[self.tf_topic])
-
         while reader.has_next():
             (topic, data, _) = reader.read_next()
             if topic == self.tf_topic:
@@ -84,14 +82,13 @@ class BagToLabels(Node):
                         return
         del reader
         self.get_logger().warn("Could not find the 'drone_world' to 'lidar_link' static transform.")
-
+    
     def cache_bbox_messages(self, type_map):
         self.get_logger().info(f"Caching all messages from: {self.bbox_topic}")
         reader = self.get_bag_reader()
         storage_filter = rosbag2_py.StorageFilter(topics=[self.bbox_topic])
         reader.set_filter(storage_filter)
         msg_type = get_message(type_map[self.bbox_topic])
-
         while reader.has_next():
             (topic, data, timestamp_ns) = reader.read_next()
             if topic == self.bbox_topic:
@@ -101,7 +98,7 @@ class BagToLabels(Node):
         self.bbox_messages.sort(key=lambda x: x[0])
         self.get_logger().info(f"Cached {len(self.bbox_messages)} bounding box messages.")
         del reader
-
+    
     def find_closest_bbox(self, target_timestamp_ns):
         if not self.bbox_messages: return None
         timestamps = [t[0] for t in self.bbox_messages]
@@ -114,7 +111,7 @@ class BagToLabels(Node):
             return self.bbox_messages[idx - 1][1]
         else:
             return self.bbox_messages[idx][1]
-
+    
     def write_calib_file(self, frame_id_str):
         """Writes the virtual calibration file for this frame."""
         P_identity = "1.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 1.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00 1.000000e+00 0.000000e+00"
@@ -123,7 +120,6 @@ class BagToLabels(Node):
         
         tr_data = np.hstack((R_CAM_LIDAR, T_CAM_LIDAR.reshape(3, 1)))
         tr_str = " ".join([f"{x:.6e}" for x in tr_data.flatten()])
-
         content = f"""P0: {P_identity}
 P1: {P_identity}
 P2: {P_identity}
@@ -135,7 +131,7 @@ Tr_imu_to_velo: {Tr_imu}
         calib_filename = os.path.join(self.calib_dir, f"{frame_id_str}.txt")
         with open(calib_filename, 'w') as f:
             f.write(content)
-
+    
     def process_labels(self):
         """Read timestamps.csv and generate KITTI labels."""
         self.get_logger().info("Processing labels and calibration files...")
@@ -146,7 +142,6 @@ Tr_imu_to_velo: {Tr_imu}
         if not self.static_transform:
             self.get_logger().error("Static transform not found. Cannot process labels.")
             return
-
         # --- 1. Get TFs for POSITION (drone_world -> lidar_link) ---
         tf_trans_world_lidar = np.array([ # t
             self.static_transform.translation.x,
@@ -163,8 +158,6 @@ Tr_imu_to_velo: {Tr_imu}
         # We need the INVERSE to move points from world -> lidar
         # P_lidar = R_inv * (P_world - t)
         tf_rot_lidar_world_mat = tf_rot_world_lidar_mat.T # R_inv
-
-
         # --- 2. Get TFs for ROTATION (drone_world -> camera_0) ---
         
         # Q_world_lidar: Quaternion for drone_world -> lidar_link
@@ -181,7 +174,7 @@ Tr_imu_to_velo: {Tr_imu}
         # This is the total rotation from the drone's *static* world frame 
         # to the camera frame
         q_cam_world = tf_transformations.quaternion_multiply(Q_CAM_LIDAR, q_world_lidar)
-
+        
         with open(self.timestamp_file, 'r') as ts_file:
             reader = csv.reader(ts_file)
             next(reader) # Skip header
@@ -212,27 +205,34 @@ Tr_imu_to_velo: {Tr_imu}
                     marker_msg.pose.orientation.w
                 ])
                 
-                # --- Step 2: Transform POSITION to camera_0 frame ---
+                # --- Step 2: Transform POSITION to lidar frame, then apply global transform ---
                 # P_lidar = R_inv * (P_world - t)
                 pos_lidar = np.dot(tf_rot_lidar_world_mat, (pos_world - tf_trans_world_lidar))
                 
-                # P_cam = R_cam_lidar * P_lidar + T_cam_lidar
-                pos_cam_center = np.dot(R_CAM_LIDAR, pos_lidar) + T_CAM_LIDAR
-
+                # Apply the same global transformation as the point cloud
+                pos_lidar_transformed = np.dot(R_GLOBAL, pos_lidar)
+                
+                # P_cam = R_cam_lidar * P_lidar_transformed + T_cam_lidar
+                pos_cam_center = np.dot(R_CAM_LIDAR, pos_lidar_transformed) + T_CAM_LIDAR
+                
                 # --- Step 3: Transform ORIENTATION to camera_0 frame ---
                 # Q_final_cam = Q(world->cam) * Q(marker->world)
                 q_final_cam = tf_transformations.quaternion_multiply(q_cam_world, q_marker_world)
-
-                # --- START: NEW ROTATION LOGIC ---
+                
+                # --- START: ROTATION LOGIC WITH GLOBAL TRANSFORM ---
                 
                 # Convert final orientation to a 3x3 rotation matrix
                 R_final_cam = tf_transformations.quaternion_matrix(q_final_cam)[:3, :3]
+                
+                # Apply the global transform to the rotation matrix
+                # This ensures the orientation is consistent with the transformed position
+                R_final_cam_transformed = np.dot(R_CAM_LIDAR, np.dot(R_GLOBAL, np.dot(R_CAM_LIDAR.T, R_final_cam)))
                 
                 # Define the drone's "forward" vector (in its own body frame)
                 v_body_fwd = np.array([1, 0, 0])
                 
                 # Rotate this vector into the camera frame
-                v_cam_fwd = R_final_cam.dot(v_body_fwd)
+                v_cam_fwd = R_final_cam_transformed.dot(v_body_fwd)
                 
                 # ry_kitti is the yaw angle of this forward vector in the
                 # camera's X-Z "ground plane".
@@ -243,7 +243,7 @@ Tr_imu_to_velo: {Tr_imu}
                 h_kitti = marker_msg.scale.z # h = z-dim
                 w_kitti = marker_msg.scale.y # w = y-dim
                 l_kitti = marker_msg.scale.x # l = x-dim
-
+                
                 # --- Step 5: Format for KITTI label file ---
                 # Get (x, y, z) in camera 0 frame (bottom-center)
                 x_kitti = pos_cam_center[0]
@@ -256,8 +256,8 @@ Tr_imu_to_velo: {Tr_imu}
                 # Wrap alpha to be [-pi, pi]
                 alpha_kitti = (alpha_kitti + np.pi) % (2 * np.pi) - np.pi
                 
-                # --- END: NEW ROTATION LOGIC ---
-
+                # --- END: ROTATION LOGIC ---
+                
                 object_type = "Drone"
                 truncation = 0.0
                 occlusion = 0
@@ -278,7 +278,7 @@ Tr_imu_to_velo: {Tr_imu}
                     self.get_logger().info(f"Processed label & calib for frame {frame_id}")
                     
         self.get_logger().info("Finished processing all labels and calibration files.")
-
+    
     def run(self):
         type_map = self.get_topic_map()
         if self.bbox_topic not in type_map or self.tf_topic not in type_map:
@@ -316,8 +316,9 @@ def main(args=None):
         type=str, 
         default='/tf_static', 
         help='The TF static topic name')
+    
     parsed_args = parser.parse_args(args=rclpy.utilities.remove_ros_args(args=sys.argv[1:]))
-
+    
     node = BagToLabels(
         bag_path=parsed_args.bag_path,
         output_path=parsed_args.output_path,
